@@ -11,39 +11,42 @@ from launch.substitutions import LaunchConfiguration
 from launch.actions import DeclareLaunchArgument
 
 def generate_launch_description():
-    config = os.path.join(
-        get_package_share_directory('ros2_laser_scan_merger'),
-        'config',
-        'params.yaml'
-    )
+    config_file_cmd = DeclareLaunchArgument(
+        'config_file',
+        default_value=os.path.join(
+            get_package_share_directory('ros2_laser_scan_merger'),
+            'config',
+            'params.yaml'))
+    remapping_param_point_cmd = DeclareLaunchArgument(
+        'pointcloud_remapping',
+        default_value="/cloud_in")
+    remapping_param_scan_cmd = DeclareLaunchArgument(
+        'scan_remapping',
+        default_value="/scan")
+
     return LaunchDescription([
+        config_file_cmd,
+        remapping_param_point_cmd,
+        remapping_param_scan_cmd,
         
         launch_ros.actions.Node(
             package='ros2_laser_scan_merger',
             executable='ros2_laser_scan_merger',
-            parameters=[config],
+            parameters=[LaunchConfiguration('config_file')],
             output='screen',
             respawn=True,
             respawn_delay=2,
         ),
-        # TF2 for laser to map frame id, optional
-        # launch_ros.actions.Node(
-        #     package='tf2_ros',
-        #     executable='static_transform_publisher',
-        #     name='static_transform_publisher',
-        #     arguments=[
-        #         '--x', '0', '--y', '0', '--z', '0',
-        #         '--qx', '0', '--qy', '0', '--qz', '0', '--qw', '1',
-        #         '--frame-id', 'map', '--child-frame-id', 'laser'
-        #     ]
-        # ),
 
-        # Call pointcloud_to_laserscan package
         launch_ros.actions.Node(
             name='pointcloud_to_laserscan',
             package='pointcloud_to_laserscan',
             executable='pointcloud_to_laserscan_node',
-            parameters=[config]
+            remappings=[
+                ('/cloud_in', LaunchConfiguration('pointcloud_remapping')),
+                ('/scan', LaunchConfiguration('scan_remapping')),
+            ],
+            parameters=[LaunchConfiguration('config_file')],
         )
         
     ])
