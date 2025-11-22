@@ -2,356 +2,212 @@
 //   created by: Michael Jonathan (mich1342)
 //   github.com/mich1342
 //   24/2/2022
+//   日本語コメント追加 by Gemini Code Assist
 //
 
-#include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/laser_scan.hpp>
-
-#include <pcl_conversions/pcl_conversions.h>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/point_cloud2_iterator.hpp>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
-
+// C++ standard libraries
 #include <cmath>
-
 #include <string>
 #include <vector>
 #include <array>
-#include <iostream>
+#include <algorithm>
 
+// ROS2 libraries
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
+#include "tf2_sensor_msgs/tf2_sensor_msgs.hpp"
+#include "rcl_interfaces/msg/parameter_descriptor.hpp"
+#include "laser_geometry/laser_geometry.hpp"
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
+// PCL libraries
+#include <pcl_conversions/pcl_conversions.h>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
+
+// 2つのLaserScanメッセージを時間で同期させるためのポリシー定義
+typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::LaserScan, sensor_msgs::msg::LaserScan> MySyncPolicy;
+
+/**
+ * @class scanMerger
+ * @brief 複数のLaserScanメッセージを購読し、それらを一つのPointCloud2メッセージにマージするROS 2ノード。
+ * 
+ * このクラスは、message_filtersを使用して複数のLaserScanトピックを同期し、
+ * laser_geometryとtf2を使用して各スキャンを共通の座標系に変換後、
+ * 一つのPointCloud2としてパブリッシュします。
+ */
 class scanMerger : public rclcpp::Node
 {
 public:
-  scanMerger() : Node("ros2_laser_scan_merger")
+  // message_filtersの同期ポリシーで使用するキューのサイズ
+  static constexpr int SYNC_POLICY_QUEUE_SIZE = 10;
+
+  // コンストラクタ
+  scanMerger() : Node("ros2_laser_scan_merger"), tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_)
   {
+    RCLCPP_INFO(this->get_logger(), "TFを使用して座標変換を行います。");
+
+    // パラメータの初期化と読み込み
     initialize_params();
-    refresh_params();
+    load_params(); // 初期値を読み込む
 
-    laser1_ = std::make_shared<sensor_msgs::msg::LaserScan>();
-    laser2_ = std::make_shared<sensor_msgs::msg::LaserScan>();
+    // パラメータが外部から変更されたときに呼び出されるコールバック関数を登録
+    param_callback_handle_ = this->add_on_set_parameters_callback(std::bind(&scanMerger::parameters_callback, this, std::placeholders::_1));
 
+    // 2つのLaserScanトピックを購読するためのSubscriberを作成
     auto default_qos = rclcpp::QoS(rclcpp::SensorDataQoS());
-    sub1_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-        topic1_, default_qos, std::bind(&scanMerger::scan_callback1, this, std::placeholders::_1));
-    sub2_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-        topic2_, default_qos, std::bind(&scanMerger::scan_callback2, this, std::placeholders::_1));
+    sub1_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::LaserScan>>(this, topic1_, default_qos.get_rmw_qos_profile());
+    sub2_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::LaserScan>>(this, topic2_, default_qos.get_rmw_qos_profile());
+
+    // 2つのトピックをタイムスタンプで同期させるためのSynchronizerを作成し、コールバック関数を登録
+    sync_ = std::make_shared<message_filters::Synchronizer<MySyncPolicy>>(MySyncPolicy(SYNC_POLICY_QUEUE_SIZE), *sub1_, *sub2_);
+    sync_->registerCallback(&scanMerger::scan_callback, this);
 
     point_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(cloudTopic_, rclcpp::SensorDataQoS());
-    RCLCPP_INFO(this->get_logger(), "Hello");
   }
 
 private:
-  void scan_callback1(const sensor_msgs::msg::LaserScan::SharedPtr _msg)
+  // 同期された2つのLaserScanメッセージを受信したときに呼び出されるコールバック関数
+  void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr& laser1_msg, const sensor_msgs::msg::LaserScan::SharedPtr& laser2_msg)
   {
-    laser1_ = _msg;
-    update_point_cloud_rgb();
-    // RCLCPP_INFO(this->get_logger(), "I heard: '%f' '%f'", _msg->ranges[0],
-    //         _msg->ranges[100]);
-  }
-  void scan_callback2(const sensor_msgs::msg::LaserScan::SharedPtr _msg)
-  {
-    laser2_ = _msg;
-    // RCLCPP_INFO(this->get_logger(), "I heard: '%f' '%f'", _msg->ranges[0],
-    //         _msg->ranges[100]);
+    update_point_cloud_tf(laser1_msg, laser2_msg);
   }
 
-  void update_point_cloud_rgb()
+  // 受信したLaserScanメッセージを元に、座標変換を行いながらポイントクラウドを更新する
+  void update_point_cloud_tf(const sensor_msgs::msg::LaserScan::SharedPtr& laser1, const sensor_msgs::msg::LaserScan::SharedPtr& laser2)
   {
-    refresh_params();
-    pcl::PointCloud<pcl::PointXYZRGB> cloud_;
-    std::vector<std::array<float, 2>> scan_data;
-    int count = 0;
-    float min_theta = 0;
-    float max_theta = 0;
-    if (show1_ && laser1_)
+    // 構造化された型に変換せずにマージするため、PCLPointCloud2の方が効率的
+    pcl::PCLPointCloud2 cloud_merged;
+
+    if (show1_ && laser1)
     {
-      float temp_min_, temp_max_;
-      if( laser1_->angle_min < laser1_->angle_max){
-        temp_min_ = laser1_->angle_min;
-        temp_max_ = laser1_->angle_max;
-      } else{
-        temp_min_ = laser1_->angle_max;
-        temp_max_ = laser1_->angle_min;
-      }
-      for (float i = temp_min_; i <= temp_max_ && count < laser1_->ranges.size();
-           i += laser1_->angle_increment)
-      {
-        pcl::PointXYZRGB pt;
-        pt = pcl::PointXYZRGB(laser1R_, laser1G_, laser1B_);
-        int used_count_ = count;
-        if (flip1_)
-        {
-          used_count_ = (int)laser1_->ranges.size() - 1 - count;
-        }
-        float temp_x = laser1_->ranges[used_count_] * std::cos(i);
-        float temp_y = laser1_->ranges[used_count_] * std::sin(i);
-        pt.x =
-            temp_x * std::cos(laser1Alpha_ * M_PI / 180) - temp_y * std::sin(laser1Alpha_ * M_PI / 180) + laser1XOff_;
-        pt.y =
-            temp_x * std::sin(laser1Alpha_ * M_PI / 180) + temp_y * std::cos(laser1Alpha_ * M_PI / 180) + laser1YOff_;
-        pt.z = laser1ZOff_;
-        if ((i < (laser1AngleMin_ * M_PI / 180)) || (i > (laser1AngleMax_ * M_PI / 180)))
-        {
-          if (inverse1_)
-          {
-            cloud_.points.push_back(pt);
-            float r_ = GET_R(pt.x, pt.y);
-            float theta_ = GET_THETA(pt.x, pt.y);
-            std::array<float, 2> res_;
-            res_[1] = r_;
-            res_[0] = theta_;
-            scan_data.push_back(res_);
-            if (theta_ < min_theta)
-            {
-              min_theta = theta_;
-            }
-            if (theta_ > max_theta)
-            {
-              max_theta = theta_;
-            }
-          }
-        }
-        else
-        {
-          if (!inverse1_)
-          {
-            cloud_.points.push_back(pt);
-            float r_ = GET_R(pt.x, pt.y);
-            float theta_ = GET_THETA(pt.x, pt.y);
-            std::array<float, 2> res_;
-            res_[1] = r_;
-            res_[0] = theta_;
-            scan_data.push_back(res_);
-            if (theta_ < min_theta)
-            {
-              min_theta = theta_;
-            }
-            if (theta_ > max_theta)
-            {
-              max_theta = theta_;
-            }
-          }
-        }
-        count++;
-      }
+      process_scan_with_tf(laser1, cloud_merged);
     }
 
-    count = 0;
-    if (show2_ && laser2_)
+    if (show2_ && laser2)
     {
-      float temp_min_, temp_max_;
-      if( laser2_->angle_min < laser2_->angle_max){
-        temp_min_ = laser2_->angle_min;
-        temp_max_ = laser2_->angle_max;
-      } else{
-        temp_min_ = laser2_->angle_max;
-        temp_max_ = laser2_->angle_min;
-      }
-      for (float i = temp_min_; i <= temp_max_ && count < laser2_->ranges.size();
-           i += laser2_->angle_increment)
-      {
-        pcl::PointXYZRGB pt;
-        pt = pcl::PointXYZRGB(laser2R_, laser2G_, laser2B_);
-
-        int used_count_ = count;
-        if (flip2_)
-        {
-          used_count_ = (int)laser2_->ranges.size() - 1 - count;
-        }
-
-        float temp_x = laser2_->ranges[used_count_] * std::cos(i);
-        float temp_y = laser2_->ranges[used_count_] * std::sin(i);
-        pt.x =
-            temp_x * std::cos(laser2Alpha_ * M_PI / 180) - temp_y * std::sin(laser2Alpha_ * M_PI / 180) + laser2XOff_;
-        pt.y =
-            temp_x * std::sin(laser2Alpha_ * M_PI / 180) + temp_y * std::cos(laser2Alpha_ * M_PI / 180) + laser2YOff_;
-        pt.z = laser2ZOff_;
-        if ((i < (laser2AngleMin_ * M_PI / 180)) || (i > (laser2AngleMax_ * M_PI / 180)))
-        {
-          if (inverse2_)
-          {
-            cloud_.points.push_back(pt);
-            float r_ = GET_R(pt.x, pt.y);
-            float theta_ = GET_THETA(pt.x, pt.y);
-            std::array<float, 2> res_;
-            res_[1] = r_;
-            res_[0] = theta_;
-            scan_data.push_back(res_);
-            if (theta_ < min_theta)
-            {
-              min_theta = theta_;
-            }
-            if (theta_ > max_theta)
-            {
-              max_theta = theta_;
-            }
-          }
-        }
-        else
-        {
-          if (!inverse2_)
-          {
-            cloud_.points.push_back(pt);
-            float r_ = GET_R(pt.x, pt.y);
-            float theta_ = GET_THETA(pt.x, pt.y);
-            std::array<float, 2> res_;
-            res_[1] = r_;
-            res_[0] = theta_;
-            scan_data.push_back(res_);
-            if (theta_ < min_theta)
-            {
-              min_theta = theta_;
-            }
-            if (theta_ > max_theta)
-            {
-              max_theta = theta_;
-            }
-          }
-        }
-        count++;
-      }
+      process_scan_with_tf(laser2, cloud_merged);
     }
 
-    auto pc2_msg_ = std::make_shared<sensor_msgs::msg::PointCloud2>();
-    pcl::toROSMsg(cloud_, *pc2_msg_);
-    pc2_msg_->header.frame_id = cloudFrameId_;
-    pc2_msg_->header.stamp = now();
-    if (show1_ && laser1_)
+    // マージされたポイントクラウドに点が存在する場合にパブリッシュする
+    if (cloud_merged.width * cloud_merged.height > 0)
     {
-      pc2_msg_->header.stamp = laser1_->header.stamp;  
+      auto pc2_msg_ = std::make_shared<sensor_msgs::msg::PointCloud2>();
+      pcl_conversions::fromPCL(cloud_merged, *pc2_msg_);
+      pc2_msg_->header.frame_id = cloudFrameId_;
+      
+      // 2つのスキャンのうち、より新しい方のタイムスタンプを使用する
+      pc2_msg_->header.stamp = (rclcpp::Time(laser1->header.stamp) > rclcpp::Time(laser2->header.stamp)) ? laser1->header.stamp : laser2->header.stamp;
+
+      pc2_msg_->is_dense = false;
+      point_cloud_pub_->publish(*pc2_msg_);
     }
-    if (show2_ && laser2_)
-    {
-      pc2_msg_->header.stamp = laser2_->header.stamp;  
-    }
-    pc2_msg_->is_dense = false;
-    point_cloud_pub_->publish(*pc2_msg_);
   }
 
-  float GET_R(float x, float y)
+  /**
+   * @brief 個々のLaserScanメッセージを座標変換し、ポイントクラウドに結合する
+   * @param scan_in 入力となるLaserScanメッセージの共有ポインタ
+   * @param cloud_out 結合先となるPCLPointCloud2の参照
+   */
+  void process_scan_with_tf(const sensor_msgs::msg::LaserScan::SharedPtr& scan_in, pcl::PCLPointCloud2& cloud_out)
   {
-    return sqrt(x * x + y * y);
-  }
-  float GET_THETA(float x, float y)
-  {
-    float temp_res;
-    if ((x != 0))
-    {
-      temp_res = atan(y / x);
-    }
-    else
-    {
-      if (y >= 0)
-      {
-        temp_res = M_PI / 2;
-      }
-      else
-      {
-        temp_res = -M_PI / 2;
-      }
-    }
-    if (temp_res > 0)
-    {
-      if (y < 0)
-      {
-        temp_res -= M_PI;
-      }
-    }
-    else if (temp_res < 0)
-    {
-      if (x < 0)
-      {
-        temp_res += M_PI;
-      }
-    }
-    // RCLCPP_INFO(this->get_logger(), "x: '%f', y: '%f', a: '%f'", x, y, temp_res);
+      if (!scan_in) return;
+      
+      sensor_msgs::msg::PointCloud2 cloud_transformed;
 
-    return temp_res;
+      // TF変換で例外が発生する可能性があるため、try-catchブロックで囲む
+      try
+      {
+          // laser_geometryを使用して、LaserScanをターゲットフレームのPointCloud2に投影する
+          // 2つのポイントクラウドが同じフィールドを持つようにするため（結合のため）、
+          // 'intensity'チャンネルを無効にし、'index'チャンネルのみを明示的に要求する。
+          // これにより、一方のスキャンに強度情報があり、もう一方にない場合のエラーを防ぐ。
+          int channel_options = laser_geometry::channel_option::Index;
+          projector_.transformLaserScanToPointCloud(cloudFrameId_, *scan_in, cloud_transformed, tf_buffer_, -1.0, channel_options);
+
+          // PCLに変換してマージする。PCLPointCloud2を使用することで、コストの高いpcl::PointCloudへの変換を回避できる。
+          pcl::PCLPointCloud2 cloud_to_merge;
+          pcl_conversions::toPCL(cloud_transformed, cloud_to_merge);
+          
+          // 既存のクラウドに新しいクラウドを結合する
+          pcl::concatenate(cloud_out, cloud_to_merge, cloud_out);
+      }
+      catch (tf2::TransformException &ex)
+      {
+          RCLCPP_WARN(this->get_logger(), "%s から %s への座標変換ができませんでした: %s", scan_in->header.frame_id.c_str(), cloudFrameId_.c_str(), ex.what());
+          return;
+      }
   }
-  float interpolate(float angle_1, float angle_2, float magnitude_1, float magnitude_2, float current_angle)
-  {
-    return (magnitude_1 + current_angle * ((magnitude_2 - magnitude_1) / (angle_2 - angle_1)));
-  }
+
+  // ノード起動時にパラメータを宣言する
   void initialize_params()
   {
     this->declare_parameter("pointCloudTopic", "base/custom_cloud");
-    this->declare_parameter("pointCloutFrameId", "laser");
+    this->declare_parameter("pointCloudFrameId", "laser");
 
-    this->declare_parameter("scanTopic1", "lidar_front_right/scan");
-    this->declare_parameter("laser1XOff", -0.45);
-    this->declare_parameter("laser1YOff", 0.24);
-    this->declare_parameter("laser1ZOff", 0.0);
-    this->declare_parameter("laser1Alpha", 45.0);
-    this->declare_parameter("laser1AngleMin", -181.0);
-    this->declare_parameter("laser1AngleMax", 181.0);
-    this->declare_parameter("laser1R", 255);
-    this->declare_parameter("laser1G", 0);
-    this->declare_parameter("laser1B", 0);
+    this->declare_parameter("scanTopic1", "scan1");
     this->declare_parameter("show1", true);
-    this->declare_parameter("flip1", false);
-    this->declare_parameter("inverse1", false);
 
-    this->declare_parameter("scanTopic2", "lidar_rear_left/scan");
-    this->declare_parameter("laser2XOff", 0.315);
-    this->declare_parameter("laser2YOff", -0.24);
-    this->declare_parameter("laser2ZOff", 0.0);
-    this->declare_parameter("laser2Alpha", 225.0);
-    this->declare_parameter("laser2AngleMin", -181.0);
-    this->declare_parameter("laser2AngleMax", 181.0);
-    this->declare_parameter("laser2R", 0);
-    this->declare_parameter("laser2G", 0);
-    this->declare_parameter("laser2B", 255);
+    this->declare_parameter("scanTopic2", "scan2");
     this->declare_parameter("show2", true);
-    this->declare_parameter("flip2", false);
-    this->declare_parameter("inverse2", false);
   }
-  void refresh_params()
+
+  // パラメータが変更されたときに呼び出されるコールバック関数
+  rcl_interfaces::msg::SetParametersResult parameters_callback(const std::vector<rclcpp::Parameter> & /*parameters*/)
   {
-    this->get_parameter_or<std::string>("pointCloudTopic", cloudTopic_, "pointCloud");
-    this->get_parameter_or<std::string>("pointCloutFrameId", cloudFrameId_, "laser");
-    this->get_parameter_or<std::string>("scanTopic1", topic1_, "lidar_front_right/scan");
-    this->get_parameter_or<float>("laser1XOff", laser1XOff_, 0.0);
-    this->get_parameter_or<float>("laser1YOff", laser1YOff_, 0.0);
-    this->get_parameter_or<float>("laser1ZOff", laser1ZOff_, 0.0);
-    this->get_parameter_or<float>("laser1Alpha", laser1Alpha_, 0.0);
-    this->get_parameter_or<float>("laser1AngleMin", laser1AngleMin_, -181.0);
-    this->get_parameter_or<float>("laser1AngleMax", laser1AngleMax_, 181.0);
-    this->get_parameter_or<uint8_t>("laser1R", laser1R_, 0);
-    this->get_parameter_or<uint8_t>("laser1G", laser1G_, 0);
-    this->get_parameter_or<uint8_t>("laser1B", laser1B_, 0);
-    this->get_parameter_or<bool>("show1", show1_, true);
-    this->get_parameter_or<bool>("flip1", flip1_, false);
-    this->get_parameter_or<bool>("inverse1", inverse1_, false);
-    this->get_parameter_or<std::string>("scanTopic2", topic2_, "lidar_rear_left/scan");
-    this->get_parameter_or<float>("laser2XOff", laser2XOff_, 0.0);
-    this->get_parameter_or<float>("laser2YOff", laser2YOff_, 0.0);
-    this->get_parameter_or<float>("laser2ZOff", laser2ZOff_, 0.0);
-    this->get_parameter_or<float>("laser2Alpha", laser2Alpha_, 0.0);
-    this->get_parameter_or<float>("laser2AngleMin", laser2AngleMin_, -181.0);
-    this->get_parameter_or<float>("laser2AngleMax", laser2AngleMax_, 181.0);
-    this->get_parameter_or<uint8_t>("laser2R", laser2R_, 0);
-    this->get_parameter_or<uint8_t>("laser2G", laser2G_, 0);
-    this->get_parameter_or<uint8_t>("laser2B", laser2B_, 0);
-    this->get_parameter_or<bool>("show2", show2_, false);
-    this->get_parameter_or<bool>("flip2", flip2_, false);
-    this->get_parameter_or<bool>("inverse2", inverse2_, false);
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+      result.reason = "success";
+      load_params();
+      return result;
   }
+
+  // パラメータサーバーから値を取得し、メンバ変数に格納する
+  void load_params()
+  {
+    cloudTopic_ = this->get_parameter("pointCloudTopic").as_string();
+    cloudFrameId_ = this->get_parameter("pointCloudFrameId").as_string();
+    topic1_ = this->get_parameter("scanTopic1").as_string();
+    show1_ = this->get_parameter("show1").as_bool();
+
+    topic2_ = this->get_parameter("scanTopic2").as_string();
+    show2_ = this->get_parameter("show2").as_bool();
+  }
+
+  // --- メンバ変数 ---
+  // パラメータから読み込む変数
   std::string topic1_, topic2_, cloudTopic_, cloudFrameId_;
-  bool show1_, show2_, flip1_, flip2_, inverse1_, inverse2_;
-  float laser1XOff_, laser1YOff_, laser1ZOff_, laser1Alpha_, laser1AngleMin_, laser1AngleMax_;
-  uint8_t laser1R_, laser1G_, laser1B_;
+  bool show1_, show2_;
+  // laser_geometryはスキャンごとの色付けをサポートしていないため、色に関するパラメータは不要になった
+  // uint8_t laser1R_, laser1G_, laser1B_;
+  // uint8_t laser2R_, laser2G_, laser2B_;
+  
+  // 事前計算した三角関数のテーブル（LUT）も不要になった
+  // std::vector<float> lut_cos1_, lut_sin1_;
+  // std::vector<float> lut_cos2_, lut_sin2_;
 
-  float laser2XOff_, laser2YOff_, laser2ZOff_, laser2Alpha_, laser2AngleMin_, laser2AngleMax_;
-  uint8_t laser2R_, laser2G_, laser2B_;
+  // TF2関連
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
 
-  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub1_;
-  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub2_;
+  // message_filters関連
+  std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::LaserScan>> sub1_;
+  std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::LaserScan>> sub2_;
+  std::shared_ptr<message_filters::Synchronizer<MySyncPolicy>> sync_;
+
+  // ROS 2インターフェース
+  OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_pub_;
+  // LaserScanからPointCloud2への変換を行うためのユーティリティ
+  laser_geometry::LaserProjection projector_;
 
-  sensor_msgs::msg::LaserScan::SharedPtr laser1_;
-  sensor_msgs::msg::LaserScan::SharedPtr laser2_;
 };
 
+// main関数: ノードを初期化し、実行（スピン）する
 int main(int argc, char* argv[])
 {
   rclcpp::init(argc, argv);
