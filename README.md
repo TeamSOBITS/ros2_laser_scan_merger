@@ -61,7 +61,7 @@ RGB-Dカメラから得られる点群と2D Lidarのトピックをマージす�
 
 2. 本レポジトリをcloneします．
     ```sh
-    git clone -b feature/humble-devel https://github.com/TeamSOBITS/ros2_laser_scan_merger.git
+    git clone -b humble-devel https://github.com/TeamSOBITS/ros2_laser_scan_merger.git
     ```
 3. レポジトリの中へ移動します．
     ```sh
@@ -85,7 +85,12 @@ RGB-Dカメラから得られる点群と2D Lidarのトピックをマージす�
 <p align="right">(<a href="#readme-top">上に戻る</a>)</p>
 
 ## 実行・操作方法
-RGB-Dカメラの点群と2D Lidarのスキャンをマージする場合、以下のコマンドを実行します。
+
+実行する前に,[Sobits Navigation Stack](https://github.com/TeamSOBITS/sobits_navigation_stack)がインストールされているか確認してください.
+
+1. ロボットを起動し,3次元点群が発行されているか確認する.
+
+2. RGB-Dカメラの点群と2D Lidarのスキャンをマージする場合、[merge_2_scan.launch.py ](launch/merge_2_scan.launch.py)で`robot_name`を使用するロボット名に変更し，以下のコマンドを実行します。
 
 ```sh
 ros2 launch ros2_laser_scan_merger merge_2_scan.launch.py 
@@ -95,7 +100,7 @@ ros2 launch ros2_laser_scan_merger merge_2_scan.launch.py
 
 ## パラメータ
 
-`config` ディレクトリ内の `params.yaml` ファイルで設定されます．
+以下は[Sobits Navigation Stack](https://github.com/TeamSOBITS/sobits_navigation_stack/tree/humble-devel/sobits_slam/param)の `sensor_fusion_config.yaml` でロボットごとに設定可能なパラメータです．
 
 - RGB-Dカメラの点群をLaserScan型に変換するパラメータは以下の通りです．
 
