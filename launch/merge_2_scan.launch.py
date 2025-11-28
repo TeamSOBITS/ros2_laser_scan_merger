@@ -5,57 +5,50 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.descriptions import ParameterFile
 
-def parse_yaml_for_remappings(yaml_path):
-    remappings = {
-        'cloud_in_target': '/hsrb/head_rgbd_sensor/depth_registered/points',
-        'cam_scan_target': '/hsrb/camera_scan',
-        'merged_pc_topic': '/hsrb/merged_cloud',
-        'final_scan_target': '/hsrb/merged_scan'
-    }
+def get_config_value(yaml_path, node_name, param_name, default_value):
     try:
+        if not os.path.exists(yaml_path):
+            return default_value
         with open(yaml_path, 'r') as f:
-            config_data = yaml.safe_load(f)
-        
-        cam_params = config_data.get('/camera_pointcloud_to_scan', {}).get('ros__parameters', {})
-        remappings['cloud_in_target'] = cam_params.get('remap_cloud_in_target', remappings['cloud_in_target'])
-        remappings['cam_scan_target'] = cam_params.get('remap_scan_out_target', remappings['cam_scan_target'])
-
-        merger_params = config_data.get('/ros2_laser_scan_merger', {}).get('ros__parameters', {})
-        remappings['merged_pc_topic'] = merger_params.get('pointCloudTopic', remappings['merged_pc_topic'])
-
-        final_pc_params = config_data.get('/pointcloud_to_laserscan', {}).get('ros__parameters', {})
-        final_pc_in_target = final_pc_params.get('remap_cloud_in_target', remappings['merged_pc_topic'])
-        remappings['merged_pc_topic'] = final_pc_in_target
-        remappings['final_scan_target'] = final_pc_params.get('remap_scan_out_target', remappings['final_scan_target'])
-
+            config = yaml.safe_load(f)
+        return config.get(node_name, {}).get('ros__parameters', {}).get(param_name, default_value)
     except Exception as e:
-        print(f"[WARN] Failed to parse YAML: {e}")
-    return remappings
+        print(f"[WARN] Failed to read YAML for {node_name}.{param_name}: {e}")
+        return default_value
 
 def launch_setup(context, *args, **kwargs):
     robot_name = LaunchConfiguration('robot_name').perform(context)
     
     bringup_dir = get_package_share_directory('sobits_slam')
-    config_file_path = os.path.join(bringup_dir, 'param', robot_name, 'slamtool_config.yaml')
-    remap_data = parse_yaml_for_remappings(config_file_path)
+    config_file_path = os.path.join(bringup_dir, 'param', robot_name, 'sensor_fusion_config.yaml')
+
+    configured_params = ParameterFile(config_file_path)
+
+    cam_in_topic = get_config_value(config_file_path, '/camera_pointcloud_to_scan', 'remap_cloud_in_target', '/hsrb/head_rgbd_sensor/depth_registered/points')
+    cam_out_topic = get_config_value(config_file_path, '/camera_pointcloud_to_scan', 'remap_scan_out_target', '/hsrb/camera_scan')
+    
+    final_pc_in_topic_default = get_config_value(config_file_path, '/ros2_laser_scan_merger', 'pointCloudTopic', '/cloud_in')
+    final_pc_in_topic = get_config_value(config_file_path, '/pointcloud_to_laserscan', 'remap_cloud_in_target', final_pc_in_topic_default)
+    final_scan_out_topic = get_config_value(config_file_path, '/pointcloud_to_laserscan', 'remap_scan_out_target', '/hsrb/merged_scan')
 
     camera_pc_to_scan_node = Node(
         package='pointcloud_to_laserscan', 
         executable='pointcloud_to_laserscan_node',
         name='camera_pointcloud_to_scan',  
         remappings=[
-            ("cloud_in", remap_data['cloud_in_target']),
-            ("scan", remap_data['cam_scan_target'])
+            ("cloud_in", cam_in_topic),
+            ("scan", cam_out_topic)
         ],
-        parameters=[config_file_path],
+        parameters=[configured_params],
         output='screen',
     )
     
     scan_merger_node = Node(
         package='ros2_laser_scan_merger',
         executable='ros2_laser_scan_merger',
-        parameters=[config_file_path],
+        parameters=[configured_params],
         output='screen',
         respawn=True,
         respawn_delay=2.0,
@@ -65,10 +58,10 @@ def launch_setup(context, *args, **kwargs):
         name='pointcloud_to_laserscan',
         package='pointcloud_to_laserscan',
         executable='pointcloud_to_laserscan_node',
-        parameters=[config_file_path],
+        parameters=[configured_params],
         remappings=[
-            ("cloud_in", remap_data['merged_pc_topic']),
-            ("scan", remap_data['final_scan_target'])
+            ("cloud_in", final_pc_in_topic),
+            ("scan", final_scan_out_topic)
         ],
         output='screen'
     )
