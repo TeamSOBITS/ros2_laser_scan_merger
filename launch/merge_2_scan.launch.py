@@ -23,16 +23,23 @@ def generate_launch_description():
     remapping_param_scan_cmd = DeclareLaunchArgument(
         'scan_remapping',
         default_value="/scan")
+    use_sim_time_cmd = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false')
 
     return LaunchDescription([
         config_file_cmd,
         remapping_param_point_cmd,
         remapping_param_scan_cmd,
+        use_sim_time_cmd,
         
         launch_ros.actions.Node(
             package='ros2_laser_scan_merger',
             executable='ros2_laser_scan_merger',
-            parameters=[LaunchConfiguration('config_file')],
+            parameters=[
+                LaunchConfiguration('config_file'),
+                {'use_sim_time': LaunchConfiguration('use_sim_time')}
+            ],
             output='screen',
             respawn=True,
             respawn_delay=2,
@@ -46,7 +53,10 @@ def generate_launch_description():
                 ('/cloud_in', LaunchConfiguration('pointcloud_remapping')),
                 ('/scan', LaunchConfiguration('scan_remapping')),
             ],
-            parameters=[LaunchConfiguration('config_file')],
+            parameters=[
+                LaunchConfiguration('config_file'),
+                {'use_sim_time': LaunchConfiguration('use_sim_time')}
+            ],
         )
         
     ])
